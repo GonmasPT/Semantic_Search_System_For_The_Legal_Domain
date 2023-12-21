@@ -7,12 +7,6 @@ from unidecode import unidecode
 import string
 import os.path
 import pickle
-from sentence_transformers import InputExample
-from sentence_transformers.evaluation import InformationRetrievalEvaluator
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.evaluation import SentenceEvaluator
-import torch
-
 
 
 def retrieve_corpus():
@@ -34,28 +28,6 @@ def retrieve_corpus():
                 articles[article_id] = line.strip()
             elif re.match("\((\d+|[ivxlcdm]+)\)", line):
                 articles[article_id] = articles[article_id] + " " + line.strip()
-        return articles
-
-
-def retrieve_segmented_corpus():
-    with open('data/dataset.txt', 'r') as file:
-        lines = file.readlines()
-        articles = defaultdict(list)
-        article_id = ''
-
-        # Iterate over each line in the file
-        for line in lines:
-            # Check if the line starts with "Article"
-            if line.startswith("Article") and not line.startswith("Articles"):
-                # Get article id
-                match = re.match(r"Article\s+(\d+(?:-\d+)?)", line)
-                article_id = match.group(1)
-                # Remove id from segment
-                line = re.sub(match.group(0), "", line)
-                # Add segment to the corresponding id
-                articles[article_id].append(line.strip())
-            elif re.match("\((\d+|[ivxlcdm]+)\)", line):
-                articles[article_id].append(line.strip())
         return articles
 
 
@@ -101,15 +73,6 @@ def retrieve_training_data():
     return query_id__query, query_id__rel_docs
 
 
-def print_corpus(corpus):
-    # Open the output file for writing
-    with open('OriginalArticles.txt', 'w') as output_file:
-        # Write the articles to the output file
-        for article in corpus:
-            output_file.write(article)
-            output_file.write("\n")
-
-
 def lexical_process_corpus(articles):
     #nltk.download('stopwords')
     #nltk.download('punkt')
@@ -148,23 +111,6 @@ def lexical_process_queries(queries):
     return processed_queries
 
 
-def join_query_docs_sets(queries, relevant_docs):
-    query_doc_dict = {}
-    
-    for i, query in enumerate(queries):
-        if query not in query_doc_dict:
-            query_doc_dict[query] = set()
-        query_doc_dict[query].add(relevant_docs[i])
-
-    return query_doc_dict
-
-
-def average_words_per_segment(segments):
-    total_words = sum(len(segment[0].split()) for segment in segments)
-    average_words = total_words / len(segments)
-    return round(average_words)
-
-
 def normalize_scores(tuple_list):
     scores = [float(t[2]) for t in tuple_list]
 
@@ -182,20 +128,46 @@ def callback_model_score(score, epoch, steps):
     print(f"After epoch {epoch}, the evaluator score is {score}")
 
 
-class LossEvaluator(SentenceEvaluator):
-    def __init__(self, dataloader, loss_fn):
-        self.dataloader = dataloader
-        self.loss_fn = loss_fn
+def combine_scores(semantic_scores, lexical_scores=None):
+    normalized_semantic_scores = semantic_scores
+    if lexical_scores: normalized_lexical_scores = normalize_scores(lexical_scores)
 
-    def __call__(self, model, output_path=None, epoch=None, steps=None):
-        model.eval()
-        with torch.no_grad():
-            total_loss = 0
-            for batch in self.dataloader:
-                inputs, labels = batch
-                inputs = inputs.to(model.device)
-                labels = labels.to(model.device)
-                outputs = model.encode(inputs)
-                loss = self.loss_fn(outputs, labels)
-                total_loss += loss.item()
-        return total_loss / len(self.dataloader)
+    # Combine the two lists
+    combined_scores = []
+    if lexical_scores:
+        for lexical_score, semantic_score in zip(normalized_lexical_scores, normalized_semantic_scores):
+            combined_scores.append((lexical_score[0], lexical_score[1], (lexical_score[2] + float(semantic_score[2])) / 2))
+    else:
+        for semantic_score in normalized_semantic_scores:
+            combined_scores.append(semantic_score[0], semantic_score[1], float(semantic_score[2]))
+
+    #combined_scores = normalized_semantic_scores
+    #combined_scores = normalized_lexical_scores
+
+    # Group the data by query
+    query_id_group = defaultdict(list)
+    for tup in combined_scores:
+        query_id_group[tup[0]].append(tup)
+
+    # Sort the tuples within each group by score and select the top 4 segments
+    top_articles_filtered = {}
+
+    for query_id, tuples in query_id_group.items():
+        sorted_tuples = sorted(tuples, key=lambda x: x[2], reverse=True)
+        #filtered_articles = sorted_tuples[:2]
+        filtered_articles = [sorted_tuples[0]]  # Start with the top segment
+        top_1_score = sorted_tuples[0][2]  # Get the score of the top segment
+        for tup in sorted_tuples[1:]:  # Iterate over the remaining sorted_tuples
+            if len(filtered_articles) >= 4:  # Ensure there are no more than 4 segments per query
+                break
+
+            if float(tup[2]) >= float(top_1_score) * 0.91 and len(filtered_articles) < 2:
+                filtered_articles.append(tup)
+            elif float(tup[2]) >= float(top_1_score) * 0.85 and len(filtered_articles) >= 2:
+                filtered_articles.append(tup)
+            else:
+                break  # Break the loop since the tuples are sorted in descending order, and the remaining ones won't meet the conditions
+
+        top_articles_filtered[query_id] = filtered_articles
+
+    return top_articles_filtered

@@ -1,6 +1,7 @@
 from ThesisModelFunctionsOriginal import *
+from ChatModelHelperFunctions import *
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer, losses, util
+from sentence_transformers import SentenceTransformer, losses, util, InputExample
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
 from torch.utils.data import DataLoader
 import torch
@@ -13,24 +14,38 @@ from ray.air import session
 import json
 import os
 import sys
+import panel as pn
+from bokeh.models.widgets import Button
+from bokeh.models import TextInput
+from bokeh.models import Div
+from openai.embeddings_utils import get_embedding, cosine_similarity
 
 
-###
-#model = SentenceTransformer('all-MiniLM-L6-v2')
-#model = SentenceTransformer('multi-qa-MiniLM-L6-cos-v1')
-#model = SentenceTransformer('multi-qa-distilbert-cos-v1')
-model = SentenceTransformer('multi-qa-mpnet-base-cos-v1')
+models = ["all-roberta-large-v1",
+          "all-MiniLM-L6-v2",
+          "all-mpnet-base-v2",
+          "multi-qa-mpnet-base-dot-v1",
+          "OpenAI",
+]
+chat_models = ["OpenAI",
+             "Anthropic"
+]
 
 
-if __name__ == '__main__':
-
+def main():
     torch.cuda.empty_cache()
+    model_name = models[3] # Choose embedding model
+    chat_model_name = chat_models[0] # Choose chat model
 
     # Retrieve all data and queries
     article_id__article = retrieve_corpus()
     query_id__query, query_id__rel_docs_id = retrieve_training_data()
     art_id_list = list(article_id__article.keys())
     article_list = list(article_id__article.values())
+
+    #--------------------------------------------------------------------------
+    # Prepare train, val and test data
+    #--------------------------------------------------------------------------
 
     pickle_file = "original_split_data.pkl"
     if os.path.isfile(pickle_file):
@@ -59,7 +74,7 @@ if __name__ == '__main__':
         val_query_id__rel_docs_id = {key: value for idx, (key, value) in enumerate(shuffled_query_id__rel_docs_id.items()) if idx >= len_train and idx < len_train+len_val}
         test_query_id__rel_docs_id = {key: value for idx, (key, value) in enumerate(shuffled_query_id__rel_docs_id.items()) if idx >= len_train+len_val}
         
-        # Create the training InputExamples of all data
+        # Create the training list
         training_data = []
         for query, rel_docs_id in zip(list(train_query_id__query.values()), list(train_query_id__rel_docs_id.values())):
             for rel_doc in rel_docs_id:
@@ -83,27 +98,29 @@ if __name__ == '__main__':
             pickle.dump((training_data, validation_data, test_data, val_query_id__query, test_query_id__query, test_query_id__rel_docs_id), f)
 
     #--------------------------------------------------------------------------
-    # Get BERT ready
+    # Prepare BM25
     #--------------------------------------------------------------------------
 
-    user_input = int(input("Please choose mode (1-> Use existing model; 2-> Train new model; 3-> Run hyperparameter tuning): "))
+    corpus_processed = lexical_process_corpus(article_list)
+    queries_processed = lexical_process_queries(list(test_query_id__query.values()))
+    bm25 = BM25Okapi(corpus_processed)
+
+    #--------------------------------------------------------------------------
+    # Prepare BERT
+    #--------------------------------------------------------------------------
+
+    user_model = int(input("1 -> Local Model; 2 -> Openai Model\nType 1 or 2: "))
     output_dir = 'model_original'
+    model = None
 
-    if user_input == 1: # Use existing model
-
+    if user_model == 1: # Use Local model
         if os.path.exists(output_dir):
             model = SentenceTransformer(output_dir)
         else:
-            sys.exit("Terminating the program. No model found, choose another mode.")    
-
-    elif user_input == 2: # Train new model
-
-        if os.path.exists(output_dir):
-            sys.exit("Terminating the program. Delete existing model or choose another mode.")
-        else:
             train_dataloader = DataLoader(training_data, shuffle=True, batch_size=16)
-            loss_function = losses.MultipleNegativesRankingLoss(model=model)
+            loss_function = losses.MultipleNegativesRankingLoss(model=model_name)
             evaluator = InformationRetrievalEvaluator(val_query_id__query, article_id__article, validation_data, batch_size=16)
+            model = SentenceTransformer(model_name)
             model = model.to('cuda')
 
             # Configure the training
@@ -117,15 +134,18 @@ if __name__ == '__main__':
                     show_progress_bar=True)
             model.save(output_dir)
 
-    elif user_input == 3: # Perform hyper-parameter tuning
+    elif user_model == 2: # Use Openai Model
+        pass
 
+    elif user_model == 3: # Perform hyper-parameter tuning
         if os.path.exists(output_dir):
             sys.exit("Terminating the program. Delete existing model or choose another mode.")
         else:
             def train_transformer(config):
                 train_dataloader = DataLoader(training_data, shuffle=True, batch_size=16)
-                loss_function = losses.MultipleNegativesRankingLoss(model=model)
+                loss_function = losses.MultipleNegativesRankingLoss(model=model_name)
                 evaluator = InformationRetrievalEvaluator(val_query_id__query, article_id__article, validation_data, batch_size=16)
+                model = SentenceTransformer(model_name)
 
                 # Configure the training
                 model.fit(train_objectives=[(train_dataloader, loss_function)],
@@ -144,7 +164,6 @@ if __name__ == '__main__':
                 "warmup_steps": tune.choice([20, 25, 30, 35]),
                 "weight_decay": tune.loguniform(1e-6, 1e-1)
             }
-
             pbt = PopulationBasedTraining(
                 time_attr="training_iteration",
                 metric="score",
@@ -156,7 +175,6 @@ if __name__ == '__main__':
                 "weight_decay": tune.loguniform(1e-6, 1e-2)
                 }
             )
-
             # Initialize Ray
             ray.init()
 
@@ -170,7 +188,6 @@ if __name__ == '__main__':
                 scheduler=pbt  # Use the PBT scheduler
                 #reuse_actors=True
             )
-
             # Get the best trial
             best_config = analysis.get_best_config("score", "max", "last")
 
@@ -185,140 +202,69 @@ if __name__ == '__main__':
 
 
     #--------------------------------------------------------------------------
-    # Get BM25 ready
+    # Perform Search
     #--------------------------------------------------------------------------
 
-    corpus_processed = lexical_process_corpus(article_list)
-    queries_processed = lexical_process_queries(list(test_query_id__query.values()))
-    bm25 = BM25Okapi(corpus_processed)
+    pickle_file = "corpus_embeddings_local.pkl"
+    if os.path.isfile(pickle_file):
+        with open(pickle_file, "rb") as f:
+            corpus_embeddings = pickle.load(f)
+    else:
+        corpus_embeddings = model.encode(article_list, batch_size=16, convert_to_tensor=True)
+        with open(pickle_file, "wb") as f:
+            pickle.dump(corpus_embeddings, f)
 
-    #--------------------------------------------------------------------------
-    # Semantic Search
-    #--------------------------------------------------------------------------
-
-    corpus_embeddings = model.encode(article_list, batch_size=16, convert_to_tensor=True)
     semantic_scores = []
+    lexical_scores = []
 
     user_input = int(input("Please choose mode (4-> Use test data queries; 5-> Read new input query): "))
 
     if user_input == 4: # Use test data queries
+        if user_model == 1 or user_model == 3:
+            # Semantic Scores
+            for query_id, query in zip(list(test_query_id__query.keys()), list(test_query_id__query.values())):
+                query_embedding = model.encode(query, batch_size=16, convert_to_tensor=True)
+                cos_scores = util.cos_sim(query_embedding, corpus_embeddings)[0].tolist()
+                for i, score in enumerate(cos_scores):
+                    semantic_scores.append((query_id, art_id_list[i], "{:.2f}".format(score)))
 
-        # Find the closest 4 articles for each query based on cosine similarity
-        for query_id, query in zip(list(test_query_id__query.keys()), list(test_query_id__query.values())):
-            query_embedding = model.encode(query, batch_size=16, convert_to_tensor=True)
-            cos_scores = util.cos_sim(query_embedding, corpus_embeddings)[0].tolist()
+            #Lexical Scores
+            for query_id, query in zip(list(test_query_id__query.keys()), queries_processed):
+                # Search and Rank the most similar articles to the query
+                bm25_scores = bm25.get_scores(query).tolist()
+                for i, score in enumerate(bm25_scores):
+                    lexical_scores.append((query_id, art_id_list[i], "{:.2f}".format(score)))
 
-            for i, score in enumerate(cos_scores):
-                semantic_scores.append((query_id, art_id_list[i], "{:.2f}".format(score)))
+            # Combine scores
+            top_articles_filtered = combine_scores(semantic_scores, lexical_scores)
 
-    elif user_input == 5: # Read input
-
-        input_query = input("Write a query: ")
-        query_embedding = model.encode(input_query, batch_size=16, convert_to_tensor=True)
-        cos_scores = util.cos_sim(query_embedding, corpus_embeddings)[0].tolist()
-        
-        for i, score in enumerate(cos_scores):
-            semantic_scores.append((input_query, art_id_list[i], "{:.2f}".format(score)))
-
-    else:
-        sys.exit("Terminating the program. Please choose a valid mode.")
-        
-    #--------------------------------------------------------------------------
-    # Lexical Search
-    #--------------------------------------------------------------------------
-
-    lexical_scores = []
-
-    if user_input == 4:
-
-        for query_id, query in zip(list(test_query_id__query.keys()), queries_processed):
-            # Search and Rank the most similar articles to the query
-            bm25_scores = bm25.get_scores(query).tolist()
-
-            for i, score in enumerate(bm25_scores):
-                lexical_scores.append((query_id, art_id_list[i], "{:.2f}".format(score)))
-
-    elif user_input == 5:
-
-            bm25_scores = bm25.get_scores(input_query).tolist()
-            
-            for i, score in enumerate(bm25_scores):
-                lexical_scores.append((input_query, art_id_list[i], "{:.2f}".format(score)))
-
-    #--------------------------------------------------------------------------
-    # Combine scores
-    #--------------------------------------------------------------------------
-
-    normalized_semantic_scores = semantic_scores
-    normalized_lexical_scores = normalize_scores(lexical_scores)
-
-    """ with open('TopArticlesSemantic.txt', 'w') as output_file:
-        for score in normalized_semantic_scores:
-            output_file.write(score[0] + " " + score[1] + " " + score[2] + '\n')
-
-    with open('TopArticlesLexical.txt', 'w') as output_file:
-        for score in normalized_lexical_scores:
-            output_file.write(score[0] + " " + score[1] + " " + "{:.2f}".format(score[2]) + '\n') """
-
-
-    # Combine the two lists
-    combined_scores = []
-    for lexical_score, semantic_score in zip(normalized_lexical_scores, normalized_semantic_scores):
-        combined_scores.append((lexical_score[0], lexical_score[1], (lexical_score[2] + float(semantic_score[2])) / 2))
-
-    #combined_scores = normalized_semantic_scores
-    #combined_scores = normalized_lexical_scores
-
-    # Group the data by query
-    query_id_group = defaultdict(list)
-    for tup in combined_scores:
-        query_id_group[tup[0]].append(tup)
-
-    # Sort the tuples within each group by score and select the top 4 segments
-    top_articles_filtered = {}
-
-    for query_id, tuples in query_id_group.items():
-        sorted_tuples = sorted(tuples, key=lambda x: x[2], reverse=True)
-        #filtered_articles = sorted_tuples[:2]
-        filtered_articles = [sorted_tuples[0]]  # Start with the top segment
-        top_1_score = sorted_tuples[0][2]  # Get the score of the top segment
-        for tup in sorted_tuples[1:]:  # Iterate over the remaining sorted_tuples
-            if len(filtered_articles) >= 4:  # Ensure there are no more than 4 segments per query
-                break
-
-            if float(tup[2]) >= float(top_1_score) * 0.91 and len(filtered_articles) < 2:
-                filtered_articles.append(tup)
-            elif float(tup[2]) >= float(top_1_score) * 0.85 and len(filtered_articles) >= 2:
-                filtered_articles.append(tup)
+        else:
+            pickle_file = "corpus_embeddings_openai.pkl"
+            if os.path.isfile(pickle_file):
+                with open(pickle_file, "rb") as f:
+                    corpus_embeddings = pickle.load(f)
             else:
-                break  # Break the loop since the tuples are sorted in descending order, and the remaining ones won't meet the conditions
+                corpus_embeddings = [get_embedding(article, engine='text-embedding-ada-002') for article in article_list]
+                with open(pickle_file, "wb") as f:
+                    pickle.dump(corpus_embeddings, f)
 
-        top_articles_filtered[query_id] = filtered_articles
+            for query_id, query in zip(list(test_query_id__query.keys()), list(test_query_id__query.values())):
+                query_embedding = get_embedding(query, engine='text-embedding-ada-002')
+                cos_scores = [cosine_similarity(corpus_embedding, query_embedding) for corpus_embedding in corpus_embeddings]
+                for i, score in enumerate(cos_scores):
+                    semantic_scores.append((query_id, art_id_list[i], "{:.2f}".format(score)))
 
-    # Print the results
-    if user_input == 4:
-        with open('FinalScores(Original).txt', 'w') as output_file:
+            top_articles_filtered = combine_scores(semantic_scores)
+
+        # Output final scores
+        with open('FinalScores.txt', 'w') as output_file:
             for query_id, articles in top_articles_filtered.items():
                 output_file.write(f"{articles}" + '\n')
-
-    elif user_input == 5:
-        print("\nSEARCH RESULTS:\n")
-        for query_id, articles in top_articles_filtered.items():
-            for article in articles:
-                print("Article " + article[1] + " with score " + "{:.2f}".format(article[2]))
-                print("\nArticle " + article[1] + ": " + article_id__article[article[1]] + "\n\n")
-
-    #--------------------------------------------------------------------------
-    # Evaluate model
-    #--------------------------------------------------------------------------
-
-    if user_input == 4: # Evaluate if using test data
 
         # Calculate evaluation metrics
         true_positives = 0
         false_positives = 0
         false_negatives = 0
-        ac = 0
 
         for query_id, top_articles_tuples in top_articles_filtered.items():
             top_articles_set = {tup[1] for tup in top_articles_tuples} # Top articles retrieved by the search engine
@@ -328,20 +274,92 @@ if __name__ == '__main__':
             fp = len(top_articles_set.difference(relevant_docs))
             fn = len(relevant_docs.difference(top_articles_set))
 
-            if tp > 0:
-                ac += 1
             true_positives += tp
             false_positives += fp
             false_negatives += fn
 
-        accuracy = ac / len(top_articles_filtered)
         precision = true_positives / (true_positives + false_positives)
         recall = true_positives / (true_positives + false_negatives)
 
         beta = 2
         f2_score = (1 + beta**2) * (precision * recall) / ((beta**2 * precision) + recall)
 
-        print(f'Accuracy: {accuracy:.2f}')
         print(f'Precision: {precision:.2f}')
         print(f'Recall: {recall:.2f}')
         print(f'F2-score: {f2_score:.2f}')
+
+    elif user_input == 5: # Read input
+        # Create a Panel TextInput widget for user input
+        input_field = TextInput(value="Type something here", align='center', sizing_mode="scale_width")
+        output_text = Div(text="Response will be displayed here", align='center')
+        input_query = ""
+        response = ""
+
+        def on_button_click():
+            global input_query, response
+            input_query = input_field.value
+            response = ""
+            semantic_scores = []
+            lexical_scores = []
+
+            if input_query.lower() == 'exit':
+                response = "A terminar o programa."
+            else:
+                #Semantic Scores
+                query_embedding = model.encode(input_query, batch_size=16, convert_to_tensor=True)
+                cos_scores = util.cos_sim(query_embedding, corpus_embeddings)[0].tolist()
+                for i, score in enumerate(cos_scores):
+                    semantic_scores.append((input_query, art_id_list[i], "{:.2f}".format(score)))
+
+                #Lexical Scores
+                bm25_scores = bm25.get_scores(input_query).tolist()
+                for i, score in enumerate(bm25_scores):
+                    lexical_scores.append((input_query, art_id_list[i], "{:.2f}".format(score)))
+
+                # Combine scores
+                top_articles_filtered = combine_scores(semantic_scores, lexical_scores)
+
+                # Output final scores
+                article_set = ""
+                lines = ""
+                print("\RELEVANT RESULTS:\n")
+                for query_id, articles in top_articles_filtered.items():
+                    for article in articles:
+                        article_set += f"#### {article_id__article[article[1]]} ####\n"
+                        lines += "Article " + article[1] + "\n\n"
+                        print("Article " + article[1] + " with score " + "{:.2f}".format(article[2]))
+                        print("\nArticle " + article[1] + ": " + article_id__article[article[1]] + "\n\n")
+
+                # Chatmodel
+                if chat_model_name == "OpenAI":
+                    messages = [{"role":"system", "content":system_message}]
+                    messages.append({"role":"user", "content":f"User query:\n<{input_query}>"})
+                    messages.append({"role":"assistant", "content":f"Set of relevant articles:\n{article_set}"})
+                    chat_response = get_completion_from_messages(messages, temperature=0)
+
+                response = chat_response + "\n\n" + "Relevant Articles:\n\n" + lines
+
+            input_field.value = ""  # Clear the input field after submission
+            output_text.text = response.replace("\n", "<br>")
+
+        # Create a Panel button to submit user input
+        submit_button = Button(label="Submit", align='center')
+        submit_button.on_click(on_button_click)
+
+        # Create a Panel app with the widgets
+        app = pn.Column(
+            input_field,
+            submit_button,
+            output_text,
+            sizing_mode="stretch_width",  # Adjust the sizing_mode for the entire layout
+        )
+
+        # Show the app in a browser
+        app.show()
+
+    else:
+        sys.exit("Terminating the program. Please choose a valid mode.")
+
+
+if __name__ == '__main__':
+    main()
