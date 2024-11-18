@@ -1,9 +1,9 @@
-from dotenv import load_dotenv
+#from dotenv import load_dotenv
 import openai
 import os
 
-load_dotenv()  # take environment variables from .env.
-openai.api_key = os.getenv("OPENAI_API_KEY")
+#load_dotenv()  # take environment variables from .env.
+#openai.api_key = os.getenv("OPENAI_API_KEY")
 
 system_message = f"""
 You are a friendly chatbot tasked with helping users regarding the Japanese Civil Law. \
